@@ -1,8 +1,17 @@
+# ==========================================================
+# 🔒 All Rights Reserved © Team DeadlineTech
+# 📁 This file is part of the DeadlineTech Project.
+# ==========================================================
+
+
+import time
+import logging
 import asyncio
 
 from pyrogram import filters
-from pyrogram.enums import ChatMembersFilter
-from pyrogram.errors import FloodWait
+from pyrogram.enums import ChatMembersFilter, ChatMembersFilter
+from pyrogram.errors import FloodWait, RPCError
+from pyrogram.types import Message
 
 from AviaxMusic import app
 from AviaxMusic.misc import SUDOERS
@@ -16,215 +25,126 @@ from AviaxMusic.utils.database import (
 from AviaxMusic.utils.decorators.language import language
 from AviaxMusic.utils.formatters import alpha_to_int
 from config import adminlist
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("Broadcast")
 
-IS_BROADCASTING = False
-
+SEMAPHORE = asyncio.Semaphore(10)
 
 @app.on_message(filters.command("broadcast") & SUDOERS)
-@language
-async def braodcast_message(client, message, _):
-    global IS_BROADCASTING
+async def broadcast_command(client, message: Message):
+    command = message.text.lower()
+    mode = "forward" if "-forward" in command else "copy"
 
-    if "-wfchat" in message.text or "-wfuser" in message.text:
-        if not message.reply_to_message or not (message.reply_to_message.photo or message.reply_to_message.text):
-            return await message.reply_text("Please reply to a text or image message for broadcasting.")
-
-        # Extract data from the replied message
-        if message.reply_to_message.photo:
-            content_type = 'photo'
-            file_id = message.reply_to_message.photo.file_id
-        else:
-            content_type = 'text'
-            text_content = message.reply_to_message.text
-            
-        caption = message.reply_to_message.caption
-        reply_markup = message.reply_to_message.reply_markup if hasattr(message.reply_to_message, 'reply_markup') else None
-
-        IS_BROADCASTING = True
-        await message.reply_text(_["broad_1"])
-
-        if "-wfchat" in message.text or "-wfuser" in message.text:
-            # Broadcasting to chats
-            sent_chats = 0
-            chats = [int(chat["chat_id"]) for chat in await get_served_chats()]
-            for i in chats:
-                try:
-                    if content_type == 'photo':
-                        await app.send_photo(chat_id=i, photo=file_id, caption=caption, reply_markup=reply_markup)
-                    else:
-                        await app.send_message(chat_id=i, text=text_content, reply_markup=reply_markup)
-                    sent_chats += 1
-                    await asyncio.sleep(0.2)
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.x)
-                except:
-                    continue
-            await message.reply_text(f"Broadcast to chats completed! Sent to {sent_chats} chats.")
-
-        if "-wfuser" in message.text:
-            # Broadcasting to users
-            sent_users = 0
-            users = [int(user["user_id"]) for user in await get_served_users()]
-            for i in users:
-                try:
-                    if content_type == 'photo':
-                        await app.send_photo(chat_id=i, photo=file_id, caption=caption, reply_markup=reply_markup)
-                    else:
-                        await app.send_message(chat_id=i, text=text_content, reply_markup=reply_markup)
-                    sent_users += 1
-                    await asyncio.sleep(0.2)
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.x)
-                except:
-                    continue
-            await message.reply_text(f"Broadcast to users completed! Sent to {sent_users} users.")
-
-        IS_BROADCASTING = False
-        return
-
-    
-    if message.reply_to_message:
-        x = message.reply_to_message.id
-        y = message.chat.id
-        reply_markup = message.reply_to_message.reply_markup if message.reply_to_message.reply_markup else None
-        content = None
+    if "-all" in command:
+        users = await get_served_users()
+        chats = await get_served_chats()
+        target_users = [u["user_id"] for u in users]
+        target_chats = [c["chat_id"] for c in chats]
+    elif "-users" in command:
+        users = await get_served_users()
+        target_users = [u["user_id"] for u in users]
+        target_chats = []
+    elif "-chats" in command:
+        chats = await get_served_chats()
+        target_users = []
+        target_chats = [c["chat_id"] for c in chats]
     else:
-        if len(message.command) < 2:
-            return await message.reply_text(_["broad_2"])
-        query = message.text.split(None, 1)[1]
-        if "-pin" in query:
-            query = query.replace("-pin", "")
-        if "-nobot" in query:
-            query = query.replace("-nobot", "")
-        if "-pinloud" in query:
-            query = query.replace("-pinloud", "")
-        if "-assistant" in query:
-            query = query.replace("-assistant", "")
-        if "-user" in query:
-            query = query.replace("-user", "")
-        if query == "":
-            return await message.reply_text(_["broad_8"])
+        return await message.reply_text("❗ Usage:\n/broadcast -all/-users/-chats [-forward]")
 
-    IS_BROADCASTING = True
-    await message.reply_text(_["broad_1"])
+    if not target_users and not target_chats:
+        return await message.reply_text("⚠ No recipients found.")
 
-    if "-nobot" not in message.text:
-        sent = 0
-        pin = 0
-        chats = []
-        schats = await get_served_chats()
-        for chat in schats:
-            chats.append(int(chat["chat_id"]))
-        for i in chats:
+    # Get content
+    if message.reply_to_message:
+        content = message.reply_to_message
+    else:
+        text = message.text
+        for kw in ["/broadcast", "-forward", "-all", "-users", "-chats"]:
+            text = text.replace(kw, "")
+        text = text.strip()
+        if not text:
+            return await message.reply_text("📝 Provide a message or reply to one.")
+        content = text
+
+    total = len(target_users + target_chats)
+    sent_users = 0
+    sent_chats = 0
+    failed = 0
+
+    await message.reply_text(
+        f"📢 <b>Broadcast Started</b>\n\n"
+        f"➤ Mode: <code>{mode}</code>\n"
+        f"👤 Users: <code>{len(target_users)}</code>\n"
+        f"👥 Chats: <code>{len(target_chats)}</code>\n"
+        f"📦 Total: <code>{total}</code>\n"
+        f"⏳ Please wait while messages are being sent..."
+    )
+
+    async def deliver(chat_id, is_user, retries=1):
+        nonlocal sent_users, sent_chats, failed
+        async with SEMAPHORE:
             try:
-                m = (
-                    await app.copy_message(chat_id=i, from_chat_id=y, message_id=x, reply_markup=reply_markup)
-                    if message.reply_to_message
-                    else await app.send_message(i, text=query)
-                )
-                if "-pin" in message.text:
-                    try:
-                        await m.pin(disable_notification=True)
-                        pin += 1
-                    except:
-                        continue
-                elif "-pinloud" in message.text:
-                    try:
-                        await m.pin(disable_notification=False)
-                        pin += 1
-                    except:
-                        continue
-                sent += 1
-                await asyncio.sleep(0.2)
-            except FloodWait as fw:
-                flood_time = int(fw.value)
-                if flood_time > 200:
-                    continue
-                await asyncio.sleep(flood_time)
-            except:
-                continue
-        try:
-            await message.reply_text(_["broad_3"].format(sent, pin))
-        except:
-            pass
+                if isinstance(content, str):
+                    await app.send_message(chat_id, content)
+                elif mode == "forward":
+                    await app.forward_messages(chat_id, message.chat.id, [content.id])
+                else:
+                    await content.copy(chat_id)
+                if is_user:
+                    sent_users += 1
+                else:
+                    sent_chats += 1
+            except FloodWait as e:
+                await asyncio.sleep(min(e.value, 60))
+                if retries > 0:
+                    return await deliver(chat_id, is_user, retries - 1)
+                failed += 1
+            except RPCError:
+                failed += 1
+            except Exception:
+                failed += 1
 
-    if "-user" in message.text:
-        susr = 0
-        served_users = []
-        susers = await get_served_users()
-        for user in susers:
-            served_users.append(int(user["user_id"]))
-        for i in served_users:
-            try:
-                m = (
-                    await app.copy_message(chat_id=i, from_chat_id=y, message_id=x, reply_markup=reply_markup)
-                    if message.reply_to_message
-                    else await app.send_message(i, text=query)
-                )
-                susr += 1
-                await asyncio.sleep(0.2)
-            except FloodWait as fw:
-                flood_time = int(fw.value)
-                if flood_time > 200:
-                    continue
-                await asyncio.sleep(flood_time)
-            except:
-                pass
-        try:
-            await message.reply_text(_["broad_4"].format(susr))
-        except:
-            pass
+    targets = [(uid, True) for uid in target_users] + [(cid, False) for cid in target_chats]
+    for i in range(0, len(targets), 100):
+        batch = targets[i:i + 100]
+        await asyncio.gather(*[deliver(chat_id, is_user) for chat_id, is_user in batch])
+        await asyncio.sleep(1.5)
 
-    if "-assistant" in message.text:
-        aw = await message.reply_text(_["broad_5"])
-        text = _["broad_6"]
-        from AviaxMusic.core.userbot import assistants
-
-        for num in assistants:
-            sent = 0
-            client = await get_client(num)
-            async for dialog in client.get_dialogs():
-                try:
-                    await client.forward_messages(
-                        dialog.chat.id, y, x
-                    ) if message.reply_to_message else await client.send_message(
-                        dialog.chat.id, text=query
-                    )
-                    sent += 1
-                    await asyncio.sleep(3)
-                except FloodWait as fw:
-                    flood_time = int(fw.value)
-                    if flood_time > 200:
-                        continue
-                    await asyncio.sleep(flood_time)
-                except:
-                    continue
-            text += _["broad_7"].format(num, sent)
-        try:
-            await aw.edit_text(text)
-        except:
-            pass
-    IS_BROADCASTING = False
+    await message.reply_text(
+        f"✅ <b>Broadcast Completed</b>\n\n"
+        f"➤ Mode: <code>{mode}</code>\n"
+        f"👤 Users Sent: <code>{sent_users}</code>\n"
+        f"👥 Chats Sent: <code>{sent_chats}</code>\n"
+        f"📦 Total Delivered: <code>{sent_users + sent_chats}</code>\n"
+        f"❌ Failed: <code>{failed}</code>"
+    )
 
 
 async def auto_clean():
-    while not await asyncio.sleep(10):
+    while True:
+        await asyncio.sleep(10)
         try:
-            served_chats = await get_active_chats()
-            for chat_id in served_chats:
+            chats = await get_active_chats()
+            for chat_id in chats:
                 if chat_id not in adminlist:
                     adminlist[chat_id] = []
-                    async for user in app.get_chat_members(
-                        chat_id, filter=ChatMembersFilter.ADMINISTRATORS
-                    ):
-                        if user.privileges.can_manage_video_chats:
-                            adminlist[chat_id].append(user.user.id)
-                    authusers = await get_authuser_names(chat_id)
-                    for user in authusers:
-                        user_id = await alpha_to_int(user)
-                        adminlist[chat_id].append(user_id)
-        except:
-            continue
 
+                # use the proper enum here 👇
+                async for member in app.get_chat_members(
+                    chat_id, filter=ChatMembersFilter.ADMINISTRATORS
+                ):
+                    # some admins may not have .privileges (older Telegram versions)
+                    if getattr(member, "privileges", None) and member.privileges.can_manage_video_chats:
+                        adminlist[chat_id].append(member.user.id)
 
-asyncio.create_task(auto_clean())
+                # add authorised helper‑users
+                for username in await get_authuser_names(chat_id):
+                    user_id = await alpha_to_int(username)
+                    adminlist[chat_id].append(user_id)
+
+        except Exception as e:
+            logger.warning(f"AutoClean error: {e}")
